@@ -26,6 +26,7 @@ import asyncpg
 import postgresql
 import psycopg2
 import psycopg2.extras
+import psycopg3
 
 
 def _chunks(iterable, n):
@@ -62,6 +63,61 @@ def psycopg_copy(conn, query, args):
     cur = conn.cursor()
     cur.copy_from(f, copy['table'], columns=copy['columns'])
     conn.commit()
+    return cur.rowcount
+
+
+def psycopg3_connect(args):
+    conn = psycopg3.connect(user=args.pguser, host=args.pghost,
+                            port=args.pgport)
+    return conn
+
+
+def psycopg3_execute(conn, query, args):
+    cur = conn.cursor(format=1)
+    cur.execute(query, args)
+    return len(cur.fetchall())
+
+
+def psycopg3_copy(conn, query, args):
+    rows, copy = args[:2]
+    f = io.StringIO()
+    writer = csv.writer(f, delimiter='\t')
+    for row in rows:
+        writer.writerow(row)
+    f.seek(0)
+    cur = conn.cursor()
+    with cursor.copy(f"COPY {copy['table']} ({copy['columns']}) FROM STDIN") as copy:
+        while data := f.read(8192):
+            copy.write(data)
+
+    conn.commit()
+    return cur.rowcount
+
+
+async def psycopg3_aconnect(args):
+    conn = await psycopg3.AsyncConnection.connect(
+        user=args.pguser, host=args.pghost, port=args.pgport)
+    return conn
+
+
+async def psycopg3_aexecute(conn, query, args):
+    cur = await conn.cursor()
+    await cur.execute(query, args)
+    return len(await cur.fetchall())
+
+
+async def psycopg3_acopy(conn, query, args):
+    f = io.StringIO()
+    writer = csv.writer(f, delimiter='\t')
+    for row in rows:
+        writer.writerow(row)
+    f.seek(0)
+    cur = await conn.cursor()
+    async with cursor.copy(f"COPY {copy['table']} ({copy['columns']}) FROM STDIN") as copy:
+        while data := f.read(8192):
+            await copy.write(data)
+
+    await conn.commit()
     return cur.rowcount
 
 
@@ -197,6 +253,8 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
 
     if arg_format == 'python':
         query = re.sub(r'\$\d+', '%s', query)
+    elif arg_format == 'binary':
+        query = re.sub(r'\$\d+', '%b', query)
 
     is_copy = query.startswith('COPY ')
     is_batch = query_args and isinstance(query_args[0], dict)
@@ -370,7 +428,9 @@ if __name__ == '__main__':
         help='PostgreSQL server user')
     parser.add_argument(
         'driver', help='driver implementation to use',
-        choices=['aiopg', 'aiopg-tuples', 'asyncpg', 'psycopg', 'postgresql'])
+        choices=[
+            'aiopg', 'aiopg-tuples', 'asyncpg', 'psycopg', 'postgresql',
+            'psycopg3', 'psycopg3-async'])
     parser.add_argument(
         'queryfile', help='file to read benchmark query information from')
 
@@ -431,6 +491,16 @@ if __name__ == '__main__':
             psycopg_connect, psycopg_execute, psycopg_copy
         is_async = False
         arg_format = 'python'
+    elif args.driver == 'psycopg3':
+        connector, executor, copy_executor = \
+            psycopg3_connect, psycopg3_execute, psycopg3_copy
+        is_async = False
+        arg_format = 'binary'
+    elif args.driver == 'psycopg3-async':
+        connector, executor, copy_executor = \
+            psycopg3_aconnect, psycopg3_aexecute, psycopg3_acopy
+        is_async = True
+        arg_format = 'binary'
     elif args.driver == 'postgresql':
         connector, executor = pypostgresql_connect, pypostgresql_execute
         is_async = False
