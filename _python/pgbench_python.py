@@ -17,6 +17,7 @@ import json
 import re
 import sys
 import time
+import threading
 
 import numpy as np
 import uvloop
@@ -245,7 +246,7 @@ def sync_worker(executor, eargs, start, duration, timeout):
 
 
 async def runner(args, connector, executor, copy_executor, batch_executor,
-                 is_async, arg_format, query, query_args, setup, teardown):
+                 arg_format, query, query_args, setup, teardown):
 
     timeout = args.timeout * 1000
     concurrency = args.concurrency
@@ -284,10 +285,7 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
     conns = []
 
     for i in range(concurrency):
-        if is_async:
-            conn = await connector(args)
-        else:
-            conn = connector(args)
+        conn = await connector(args)
         conns.append(conn)
 
     async def _do_run(run_duration):
@@ -295,24 +293,12 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
 
         tasks = []
 
-        if is_async:
-            # Asyncio driver
-            for i in range(concurrency):
-                task = worker(executor, [conns[i], query, query_args],
-                              start, run_duration, timeout)
-                tasks.append(task)
+        for i in range(concurrency):
+            task = worker(executor, [conns[i], query, query_args],
+                          start, run_duration, timeout)
+            tasks.append(task)
 
-            results = await asyncio.gather(*tasks)
-        else:
-            # Sync driver
-            with futures.ThreadPoolExecutor(max_workers=concurrency) as e:
-                for i in range(concurrency):
-                    task = e.submit(sync_worker, executor,
-                                    [conns[i], query, query_args],
-                                    start, run_duration, timeout)
-                    tasks.append(task)
-
-                results = [fut.result() for fut in futures.wait(tasks).done]
+        results = await asyncio.gather(*tasks)
 
         end = time.monotonic()
 
@@ -331,10 +317,7 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
             results, duration = await _do_run(args.duration)
         finally:
             for conn in conns:
-                if is_async:
-                    await conn.close()
-                else:
-                    conn.close()
+                await conn.close()
 
         min_latency = float('inf')
         max_latency = 0.0
@@ -386,6 +369,138 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
     finally:
         if teardown:
             await admin_conn.execute(teardown)
+
+    print(json.dumps(data))
+
+
+def run_sync(args, connector, executor, copy_executor, batch_executor,
+             arg_format, query, query_args, setup, teardown):
+
+    timeout = args.timeout * 1000
+    concurrency = args.concurrency
+
+    if arg_format == 'python':
+        query = re.sub(r'\$\d+', '%s', query)
+    elif arg_format == 'binary':
+        query = re.sub(r'\$\d+', '%b', query)
+
+    is_copy = query.startswith('COPY ')
+    is_batch = query_args and isinstance(query_args[0], dict)
+
+    if is_copy:
+        if copy_executor is None:
+            raise RuntimeError('COPY is not supported for {}'.format(executor))
+        executor = copy_executor
+
+        match = re.match('COPY (\w+)\s*\(\s*((?:\w+)(?:,\s*\w+)*)\s*\)', query)
+        if not match:
+            raise RuntimeError('could not parse COPY query')
+
+        query_info = query_args[0]
+        query_args[0] = [query_info['row']] * query_info['count']
+        query_args.append({
+            'table': match.group(1),
+            'columns': [col.strip() for col in match.group(2).split(',')]
+        })
+    elif is_batch:
+        if batch_executor is None:
+            raise RuntimeError('batch is not supported for {}'.format(executor))
+        executor = batch_executor
+
+        query_info = query_args[0]
+        query_args = [query_info['row']] * query_info['count']
+
+    conns = []
+
+    for i in range(concurrency):
+        conn = connector(args)
+        conns.append(conn)
+
+    def _do_run(run_duration):
+        start = time.monotonic()
+
+        results = []
+        def run_worker(conn):
+            res = sync_worker(executor, [conn, query, query_args],
+                              start, run_duration, timeout)
+            results.append(res)
+
+        threads = []
+        for i in range(concurrency):
+            t = threading.Thread(target=run_worker, args=(conns[i],))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        end = time.monotonic()
+
+        return results, end - start
+
+    if setup:
+        admin_conn = psycopg3.connect(user=args.pguser, host=args.pghost,
+                                      port=args.pgport, autocommit=True)
+        admin_conn.execute(setup)
+
+    try:
+        try:
+            if args.warmup_time:
+                _do_run(args.warmup_time)
+
+            results, duration = _do_run(args.duration)
+        finally:
+            for conn in conns:
+                conn.close()
+
+        min_latency = float('inf')
+        max_latency = 0.0
+        queries = 0
+        rows = 0
+        latency_stats = None
+
+        for result in results:
+            t_queries, t_rows, t_latency_stats, t_min_latency, t_max_latency =\
+                result
+            queries += t_queries
+            rows += t_rows
+            if latency_stats is None:
+                latency_stats = t_latency_stats
+            else:
+                latency_stats = np.add(latency_stats, t_latency_stats)
+            if t_max_latency > max_latency:
+                max_latency = t_max_latency
+            if t_min_latency < min_latency:
+                min_latency = t_min_latency
+
+        if is_copy:
+            copyargs = query_args[-1]
+
+            rowcount = admin_conn.execute('''
+                SELECT
+                    count(*)
+                FROM
+                    "{tabname}"
+            '''.format(tabname=copyargs['table'])).fetchone()[0]
+
+            print(rowcount, file=sys.stderr)
+
+            if rowcount < len(query_args[0]) * queries:
+                raise RuntimeError(
+                    'COPY did not insert the expected number of rows')
+
+        data = {
+            'queries': queries,
+            'rows': rows,
+            'duration': duration,
+            'min_latency': min_latency,
+            'max_latency': max_latency,
+            'latency_stats': latency_stats.tolist(),
+            'output_format': args.output_format
+        }
+
+    finally:
+        if teardown:
+            admin_conn.execute(teardown)
 
     print(json.dumps(data))
 
@@ -507,7 +622,11 @@ if __name__ == '__main__':
     else:
         raise ValueError('unexpected driver: {!r}'.format(args.driver))
 
-    runner_coro = runner(args, connector, executor, copy_executor,
-                         batch_executor, is_async,
-                         arg_format, query, query_args, setup, teardown)
-    loop.run_until_complete(runner_coro)
+    if is_async:
+        runner_coro = runner(args, connector, executor, copy_executor,
+                             batch_executor,
+                             arg_format, query, query_args, setup, teardown)
+        loop.run_until_complete(runner_coro)
+    else:
+        run_sync(args, connector, executor, copy_executor, batch_executor,
+                 arg_format, query, query_args, setup, teardown)
