@@ -101,7 +101,7 @@ async def psycopg3_aconnect(args):
 
 
 async def psycopg3_aexecute(conn, query, args):
-    cur = await conn.cursor()
+    cur = await conn.cursor(format=1)
     await cur.execute(query, args)
     return len(await cur.fetchall())
 
