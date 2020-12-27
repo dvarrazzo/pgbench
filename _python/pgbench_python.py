@@ -44,11 +44,13 @@ def _chunks(iterable, n):
 def psycopg_connect(args):
     conn = psycopg2.connect(user=args.pguser, host=args.pghost,
                             port=args.pgport)
+    conn.autocommit = True
     return conn
 
 
 def psycopg_execute(conn, query, args):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur = conn.cursor()
+    # cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute(query, args)
     return len(cur.fetchall())
 
@@ -62,13 +64,12 @@ def psycopg_copy(conn, query, args):
     f.seek(0)
     cur = conn.cursor()
     cur.copy_from(f, copy['table'], columns=copy['columns'])
-    conn.commit()
     return cur.rowcount
 
 
 def psycopg3_connect(args):
     conn = psycopg3.connect(user=args.pguser, host=args.pghost,
-                            port=args.pgport)
+                            port=args.pgport, autocommit=True)
     return conn
 
 
@@ -90,13 +91,12 @@ def psycopg3_copy(conn, query, args):
         while data := f.read(8192):
             copy.write(data)
 
-    conn.commit()
     return cur.rowcount
 
 
 async def psycopg3_aconnect(args):
     conn = await psycopg3.AsyncConnection.connect(
-        user=args.pguser, host=args.pghost, port=args.pgport)
+        user=args.pguser, host=args.pghost, port=args.pgport, autocommit=True)
     return conn
 
 
@@ -117,7 +117,6 @@ async def psycopg3_acopy(conn, query, args):
         while data := f.read(8192):
             await copy.write(data)
 
-    await conn.commit()
     return cur.rowcount
 
 
