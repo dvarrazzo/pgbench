@@ -321,7 +321,8 @@ async def runner(args, connector, executor, copy_executor, batch_executor,
             'duration': duration,
             'min_latency': min_latency,
             'max_latency': max_latency,
-            'latency_stats': latency_stats.tolist(),
+            # NOMERGE
+            # 'latency_stats': latency_stats.tolist(),
             'output_format': args.output_format
         }
 
